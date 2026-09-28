@@ -1,12 +1,11 @@
 # Fractional Boards Pipeline — Implementation Plan
 
 **Date:** 2026-09-28
-**Spec:** `docs/specs/2026-09-28-fractional-boards-pipeline-design.md`
-**Review:** `docs/specs/2026-09-28-fractional-boards-pipeline-review.md` (findings R1–R13, M1–M10)
+**Spec:** `docs/specs/2026-09-28-fractional-boards-pipeline-design.md` (review findings folded in;
+first scan limited to 15 days, D17)
 **Where:** `~/code/Jobs` (D1, D2), on a branch; one commit per task.
 
-This plan assumes the review's **blocking** findings R1–R5 are accepted. Tasks that depend on a
-review finding cite it. If a finding is rejected, drop the part of the task that cites it.
+Section references (§) are to the spec.
 
 Each task follows the same loop:
 1. Write the test with its fixtures.
@@ -25,47 +24,43 @@ node test_profile_paths.js && node test_digest_delivery.js && node test_scrape_s
 
 ## Phase 0: check the spec's assumptions against the code (no code changes)
 
-The spec was written from reading the code. Before building on it, check these points and record
-any differences at the top of the spec:
+The spec was written from reading the code. Before building on it, check these points. If one
+differs, change the spec (§13) first, then this plan.
 
 | # | Check | Where |
 |---|---|---|
 | V1 | `sanitizeForFilename('board a')` → `Board-A` | wherever it's defined |
-| V2 | "new" = URLs in today's `*_new.csv` matched by prefix; can it take a date window (R8)? | `send-daily-digest.js:~680` |
-| V3 | `sent_history.normalizeKey` signature, and that the company string is caller-supplied (R6) | `lib/sent_history.js` |
-| V4 | Which date `evaluate-jobs.js --days 7` filters on (M10); that it requires `scrapeStatus === 'ok'` | `evaluate-jobs.js` |
-| V5 | What `--run-pipeline` does when the scrape step fails (R12) | `send-daily-digest.js` |
-| V6 | The card HTML escape helper (R13) | `send-daily-digest.js` |
+| V2 | "New" = URLs in today's `*_new.csv` matched by prefix, and it can take a two-day window for board profiles (§13 A1) | `send-daily-digest.js:~680` |
+| V3 | `sent_history.normalizeKey` signature, and that the company string is caller-supplied (§13 A2) | `lib/sent_history.js` |
+| V4 | Which date `evaluate-jobs.js --days 7` filters on (§13 A3), and that it requires `scrapeStatus === 'ok'` and so skips `seen_first_run` | `evaluate-jobs.js` |
+| V5 | What `--run-pipeline` does today when the scrape step fails (§13 A4) | `send-daily-digest.js` |
+| V6 | The card HTML escape helper (§13 A5) | `send-daily-digest.js` |
 | V7 | The atomic tmp+rename writer: is it a shared function or copied inline? | `scrape-descriptions.js` |
 | V8 | `run-digest.sh` exit-code handling and heartbeat format; the `DIGEST_PLAN_ONLY` path | `run-digest.sh`, `run-digest-guard.sh` |
 | V9 | `lib/browser.js` API for starting the persistent context | `lib/browser.js` |
 | V10 | The "Exclusion Matching Rules" section and how `scrape-linkedin.js` implements it | `CLAUDE.md`, `scrape-linkedin.js` |
 
-**Done when** every row is confirmed, or the spec or plan has been changed to match the code.
+**Done when** every row is confirmed, or the spec and plan have been changed to match the code.
 
 ## Phase 1: framework
 
 ### T1. Dependencies and profile skeleton
 - `npm i cheerio fast-xml-parser`.
 - Create `profiles/fractional-boards/`:
-  - `sources.json` with `"sources": []`, `sendWhen: "any"`, `csvSubdir: "csv"`
+  - `sources.json` with `"sources": []`, `sendWhen: "any"`, `csvSubdir: "csv"` and
+    `defaults.firstRunMaxAgeDays: 15`
   - `filters.json` with the three `_placeholder` criteria (§5.3)
   - `csv/` and `state/`, each with a `.gitkeep`
 - **Done when** the regression set passes.
 
-### T2. `lib/board_ids.js` and `test_board_ids.js`
+### T2. `lib/board_ids.js` and `test_board_ids.js` (§6.5, §7.1)
 - `boardPrefix(id)`
-- `canonicalUrl(url, {keepParams|stripParams})`, which strips tracking parameters by default (R2)
-- `jobId(sourceId, {nativeId, url})`: the resolution order from §7.1, plus the synthetic-fragment
-  rule for link-less newsletter items (R1)
+- `canonicalUrl(url, stripParams)` for hashing, and `displayUrl(url)` for storage. Both strip
+  tracking parameters; only `canonicalUrl` also removes `stripParams` and the fragment.
+- `jobId(sourceId, {nativeId, url})`, following the resolution order in §7.1
 - `normKey(company, title, aliases)`, which delegates to `sent_history.normalizeKey`
-- `normCompany()`, which maps anonymous companies to `null` (R6)
-- Tests:
-  - the resolution order
-  - the `:` namespace
-  - prefixes: `board-a` → `Board-A`, and two ids that sanitise to the same prefix are detected (M7)
-  - tracking-parameter stripping, and that identifying parameters are kept
-  - two link-less items from one issue get **different** IDs (R1)
+- `normCompany(company, sourceName)`, which maps anonymous companies to `null` (§7.4)
+- Tests are as listed for `test_board_ids.js` in §10.
 
 ### T3. `lib/job_filters.js` and `test_job_filters.js`
 - Implement the CLAUDE.md exclusion rules: `excludeCompanies`, `excludeTitleKeywords`,
@@ -74,142 +69,140 @@ any differences at the top of the spec:
   `_excluded.csv`, so the new module and `scrape-linkedin.js` agree. `scrape-linkedin.js` itself
   is **not** changed (§12).
 
-### T4. `lib/sources/http.js` and `test_board_http.js`
+### T4. `lib/sources/http.js`, `lib/sources/dates.js` and their tests (§6.2, §6.3)
 - `get(url)` → `{ status: 'ok'|'bot_challenge'|'robots_blocked'|'error', httpStatus, body, note }`.
-- robots.txt cached per host, evaluated for `*`, with the RFC 9309 behaviour for 4xx and 5xx (M1).
+- robots.txt cached per host, evaluated for `*`, and following RFC 9309 for 4xx and 5xx.
 - A random per-host delay from `delayMs`, a timeout, and a browser User-Agent.
 - Challenge detection: status 403, 429 or 503, or the text markers.
-- The HTTP transport can be injected, so the test uses an in-memory fake with no network:
-  - robots allow and disallow
-  - robots 404 and 503
-  - each challenge marker
-  - a timeout becomes `error`
-  - the delay is honoured, using an injected clock
+- The HTTP transport and clock can be injected, so the test needs no network.
+- `dates.js`: absolute dates, plus EN/DE/NL relative dates; anything else → `null`.
 
-### T5. Adapter contract and `rss`
+### T5. Adapter contract, config validation and `rss`
 - `lib/sources/index.js`:
   - the registry
-  - `validateSources(json)`: unknown keys are errors, `_*` keys are allowed (R5), `enabled`
-    defaults to true (M6), ids must be unique, and prefixes must not collide
+  - `validateSources(json)`:
+    - unknown keys are errors, `_*` keys are ignored
+    - `enabled` defaults to true
+    - ids must be unique, and prefixes must not collide
+    - `firstRunMaxAgeDays` above 15 is rejected (§5.2)
 - `lib/sources/rss.js`: RSS 2.0 and Atom, `guid`/`id` → `nativeId`, `map`, and 0 items → `empty`.
 - Fixtures: `test/fixtures/boards/rss-feed.xml`, `atom-feed.xml` and `rss-empty.xml`.
 - Starts `test_board_adapters.js`.
 
 ### T6. `html-list` (`engine: fetch`)
 - The shared parsing function `parseListHtml(html, cfg)` is used by both engines. It supports:
-  - the `sel@attr` selector syntax
+  - the `css@attribute` selector syntax
   - `idPattern`
   - facts selectors
   - `noResultsSelector` → `empty`
   - `loggedOutSelector` → `logged_out`
-  - `parse_zero` judged on page 1 only (M2)
-- Pagination stops early on a page with only known IDs (M2).
-- Fixtures: a list page, a no-results page, a changed layout, a challenge page and a logged-out
-  page.
+  - `parse_zero` judged on page 1 only
+- Pagination (§6.3) stops at `maxPages`, at a page with 0 items, at a page of known IDs only, or,
+  on a first run, at a page whose items are all older than `firstRunMaxAgeDays`. Known and first-run
+  state come from `ctx.isKnown()` and `ctx.firstRun`.
+- Fixtures: a list page, a no-results page, a changed layout, a challenge page, a logged-out page,
+  and an empty page 2.
 
 ### T7. `json-api`
-- `itemsPath`, dot-path `map`, and pagination by parameter or cursor with the same early stop.
+- `itemsPath`, dot-path `map`, and pagination by parameter or cursor with the same stop rules.
 - Fixtures: a page-1 and page-2 response.
 
 ### T8. `html-list` (`engine: browser`) and the `--login` helper
 - Lazy `ctx.browser()` via `lib/browser.js` (V9), and `page.content()` → `parseListHtml`.
-- A held `SingletonLock` → `error: browser profile in use` (M5).
+- A held `SingletonLock` → `error`, note `browser profile in use`.
 - `--login <id>` opens a headed page at the source's `loginUrl` and waits for the window to close.
 - **Test:** unit-test only the lock detection and the call into `parseListHtml`; the browser is
   mocked.
 
-### T9. `imap-alerts` and the parser framework
+### T9. `imap-alerts` and the parser framework (§6.4)
 - `X-GM-RAW` search with the `from:`, `newer_than:7d` and `subject:` terms.
-- `state/imap-<id>.json` records processed `X-GM-MSGID`s and is pruned after 30 days (M3).
+- `state/imap-<id>.json` records processed `X-GM-MSGID`s and is pruned after 30 days.
 - After a successful ingest, add the label with `X-GM-LABELS`. If `archiveAfterIngest` is set,
   also remove `\Inbox`.
 - `lib/sources/parsers/<name>.js` is a function from HTML to `{ items, noRolesMarker }`.
 - 0 items with no marker → `parse_zero`.
-- `postedAt` is the email's `Date` header (M4).
-- A link-less item gets the synthetic URL and ID (R1).
+- `postedAt` is the email's `Date` header.
+- A link-less item gets the synthetic URL and `nativeId = hash(title|company)`.
 - **Test:** a fake IMAP client, plus one `.eml` fixture with a sample parser.
 
-### T10. `detail` step
+### T10. `detail` step (§6.3)
 - It runs only for records where `scrapeStatus` is neither `ok`, `seen_first_run` nor
   `detail_failed`.
-- A description under 300 characters is a teaser. `detailAttempts` counts up, and on the third
-  failure the adapter tries the `alsoOn` URLs (R10) before marking `detail_failed`.
-- A facts line is prepended to `description` (§6.3).
+- A description under 300 characters is a teaser. `detailAttempts` counts up, and after the
+  third failure the step tries each `alsoOn` URL once before marking `detail_failed`.
+- A facts line is prepended to `description`.
 - `detail: false` skips the step and takes the description from `list()`.
 
-### T11. `fetch-boards.js`: orchestration and `test_fetch_boards.js`
+### T11. `fetch-boards.js`: orchestration and `test_fetch_boards.js` (§6.1, §7)
 Per source, in config order, each inside its own try/catch:
-1. **Slot and state gates:**
+1. **Gates:**
    - due in this slot?
    - `bot_challenge` flag set for today?
    - `robots_blocked`?
-   - slot stamp already `ok` or `empty` (R7)?
-2. `list()`, then normalise, then check for ID collisions (R2).
+   - `state/<id>.last-ok` already records `ok` or `empty` for this date and slot?
+2. `list()`, then normalise, then the ID-collision check (§7.1).
 3. `job_filters`, which writes excluded items to `_excluded.csv` with a reason.
-4. Cross-board dedup by `normKey`, within 30 days and only when company is non-null (R6). A hit is
-   added to `alsoOn` and written to `_excluded` as `duplicate_of:<jobId>`.
-5. First-run cap. Old items go to master and job-data with `scrapeStatus: 'seen_first_run'`
-   (R4).
-6. For each new item, in this **write order** (R3):
+4. Cross-board dedup (§7.4.2): only for a non-null `normCompany`, within 30 days, with the
+   `seen_first_run` exception. A hit is added to `alsoOn` and written to `_excluded` as
+   `duplicate_of:<jobId>`.
+5. **First-run cap (§7.5, D17).** With no `state/<id>.first-run` marker, items posted more than
+   15 days ago, or with no `postedAt`, go to master and job-data with
+   `scrapeStatus: 'seen_first_run'`, and not to `_new.csv`.
+6. For each new item, in this **write order** (§6.1):
    1. append to master CSV and today's `_new.csv`
    2. write to job-data (atomic)
    3. run `detail`
    4. write to job-data (atomic)
-7. Write the first-run marker, the slot stamp and the run-log entry.
+7. Write the first-run marker (only if the status is `ok` or `empty`), the slot stamp and the
+   run-log entry.
+8. Log the placeholder-criteria warning.
 
-The mocked-adapter tests cover:
-- isolation (one adapter throws)
-- `alsoOn`
-- the first-run cap and `seen_first_run`
-- teaser → retry → `detail_failed`
-- slot selection and the slot-stamp skip
-- `--dry-run` writes nothing (checked by a directory snapshot before and after)
-- a crash between the CSV write and the job-data write still leaves the job "new" (R3)
-- exit codes: 0 with failing sources, and 1 for invalid config
-- the placeholder warning is logged
+Tests are as listed for `test_fetch_boards.js` in §10. The first-run cap cases must use
+`ctx.now` so the 15-day boundary is exact:
+- 16 days old → held back
+- 15 days old → new
+- no date → held back
+- a failed first run writes no marker
 
-### T12. `lib/board_health.js` and `test_board_health.js`
+### T12. `lib/board_health.js` and `test_board_health.js` (§9)
 - Status table from `logs/board-runs/*.json`, pruned after 90 days.
-- `below_floor` applies only once 7 days of logs exist (R9).
+- `below_floor` applies only once 7 days of logs exist.
+- `id_collision` notes are alert-worthy.
 - Counts consecutive errors (an alert at 2 or more).
-- At most one alert per source per day, tracked in `logs/board-health-alerts.json`. Optionally
-  backs off to weekly (M9).
+- At most one alert per source per day. A persistent condition alerts daily for 3 days, then
+  weekly. Tracked in `logs/board-health-alerts.json`.
 - `renderAlertEmail()` uses neutral wording; the test asserts that "spam" and "dropped" are absent.
 - `footerSummary()` for the digest.
 
-### T13. Digest changes in `send-daily-digest.js`, `lib/profile_paths.js`, and `test_digest_sendwhen.js`
+### T13. Digest changes in `send-daily-digest.js`, `lib/profile_paths.js`, and `test_digest_sendwhen.js` (§8.1)
 - `resolveCsvDir` reads `csvSubdir` from `sources.json`.
-- `getProfileSearchPrefixes` includes every source's `boardPrefix` (enabled or not).
+- `getProfileSearchPrefixes` includes every source's `boardPrefix` (enabled or not), with exact
+  file matching.
 - Pipeline dispatch: with `sources.json`, run `fetch-boards.js --slot`. On exit 1, carry on with
-  the data on disk and note it in the footer (R12).
-- The "new" window for board profiles follows the R8 decision.
+  the data on disk and note it in the footer.
+- Board profiles use a "new" window of today plus yesterday. LinkedIn profiles are unchanged.
 - `sendWhen`: `any`, `qualified`, or absent (legacy behaviour). A skipped send logs
   `DIGEST SKIPPED (sendWhen=…)` and records nothing in sent-history.
-- Card additions: the source and `alsoOn` line, the facts row and the posted date, all escaped
-  (R13). None of them render when the fields are missing.
+- Card additions: the source and `alsoOn` line, the facts row and the posted date, all escaped.
+  None of them render when the fields are missing.
+- Sent-history for records with a null `normCompany` uses `anon:<jobId>`.
 - Health step after the digest (T12). Its errors are logged and never change the exit code.
-- Sent-history for records with a null company uses `anon:<jobId>` (R6).
-- **Tests:**
-  - the three `sendWhen` modes
-  - prefixes
-  - a LinkedIn-shaped card renders byte-identical to before (golden file)
-  - a board card with a `<script>` title comes out escaped
+- Tests are as listed for `test_digest_sendwhen.js` in §10.
 
-### T14. `run-digest.sh` and extending `test_run_digest_slots.sh`
+### T14. `run-digest.sh` and extending `test_run_digest_slots.sh` (§9.3)
 - Add `fractional-boards` last at both slots.
 - Exit 4 → `eval_outages++`. Any other non-zero exit → `board_warnings++` with detail.
-- If R8(b) was chosen instead of (a), exit 5 → retry this profile only.
 - Heartbeat: `WITH BOARD WARNINGS: …`.
 - **Test:** plan-only mode lists the profile at both slots, and a fake profile exiting 1 counts
   as a warning, not a failure.
 
-### T15. Feedback registration and stats
+### T15. Feedback registration and stats (§8.2, §8.3)
 - Register `fractional-boards` in:
   - `web.js` `PROFILES`
   - `lib/feedback_triage.js` `PROFILES`
   - `send-review-digest.js` `sealSession`
 - A `/boards` page in `web.js` with the §8.3 table for 7, 30 and 90 days. Qualified credit is
-  shared with `alsoOn` sources (R11). CSV files are matched by exact prefix (M7).
+  shared with `alsoOn` sources. CSV files are matched by exact prefix.
 - One line per board in the weekly review email.
 - **Test:** the stats function against a fixture directory (CSVs, job-data, feedback, run logs).
 
@@ -217,8 +210,8 @@ The mocked-adapter tests cover:
 Choose a board: the first public RSS or clean-HTML board on the Cowork shortlist, or any public
 fractional board if the shortlist isn't ready. Then:
 1. Add its config entry.
-2. `node fetch-boards.js --profile fractional-boards --source <id> --dry-run`, and check the rows
-   and facts by hand.
+2. `node fetch-boards.js --profile fractional-boards --source <id> --dry-run`. Check the rows and
+   facts by hand, and check that nothing posted more than 15 days ago, or undated, would be new.
 3. Save one real response as a fixture and add an adapter test for it.
 4. `node send-daily-digest.js --run-pipeline --via-cli --profile fractional-boards --dry-run`
 5. Do one real send. **Done when** IMAP reports `delivery: inbox`.
@@ -228,16 +221,16 @@ fractional board if the shortlist isn't ready. Then:
   - the config keys
   - adding a board (the Phase 2 checklist)
   - `--dry-run` and `--login`
+  - the 15-day first-scan rule
   - the status table and what each alert means
   - a pointer to the spec
 - Rename the "JobS Project" heading to `~/code/Jobs`.
-- Fold the accepted review findings into the spec, and delete the review file.
 
 ## Phase 2: boards (one task per board or newsletter)
 
 For each item on the Cowork shortlist:
 1. config entry
-2. `--dry-run`
+2. `--dry-run`, including the 15-day check
 3. fixture
 4. adapter test
 5. `enabled: true`

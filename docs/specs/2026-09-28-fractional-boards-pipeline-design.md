@@ -1,7 +1,8 @@
 # Fractional Boards Pipeline — Design
 
 **Date:** 2026-09-28
-**Status:** Design approved in conversation; awaiting review of this written spec
+**Status:** Approved. The review findings (R1–R13, M1–M10) and the 15-day limit on the first scan
+(D17) were folded in on 2026-09-28.
 **Author:** Claude (with Gijs)
 **Related:** `docs/research/2026-09-28-fractional-boards-cowork-brief.md` (board discovery, run in Cowork)
 
@@ -36,6 +37,7 @@ structure both plug into.
 | D14 | Cross-profile suppression | **None.** A role already sent by the LinkedIn fractional profile may appear again here. Sent-history stays per profile |
 | D15 | "Empty" | `sendWhen: "any"` — email when ≥1 new job (qualified or disqualified). Switch to `"qualified"` once the rubric is tuned |
 | D16 | Gmail labels | Claude/the pipeline handles them — see §6.4. No Gmail filters are needed (the Gmail connector cannot create filters, so the design avoids them) |
+| D17 | First scan | A source's first scan never puts a job **posted more than 15 days ago**, or with no posting date, into an email (§7.5) |
 
 ## 3. Learnings this design is built on
 
@@ -52,7 +54,7 @@ Each item was established in this repo; do not "simplify" it away without re-tes
 | L7 | Liveness must never depend on an LLM run | global CLAUDE.md | Fetch, parse, health checks and heartbeat are deterministic Node/bash |
 | L8 | Gmail silently drops some self-sent digests; delivery must be verified over IMAP | CLAUDE.md, `lib/mailer.js` | Reuse `deliverDigest` unchanged |
 | L9 | Duplicated helpers drift (`"MUST stay identical"` comments in three files) | `scrape-descriptions.js`, `send-daily-digest.js` | Board code imports shared modules instead of copying |
-| L10 | Any profile exiting 1 makes the guard re-run **every** profile on the next 15-minute poll | `run-digest.sh`, `run-digest-guard.sh` | Board failures are *warnings* in `run-digest.sh`, never failures (§9.3) |
+| L10 | Any profile exiting 1 makes the guard re-run **every** profile on the next 15-minute poll | `run-digest.sh`, `run-digest-guard.sh` | Board failures are *warnings* in `run-digest.sh`, never failures (§9.3), and a board already fetched in a slot is not fetched again on a re-run (§6.1) |
 
 ## 4. Architecture
 
@@ -62,17 +64,21 @@ Each item was established in this repo; do not "simplify" it away without re-tes
 run-digest.sh ──► send-daily-digest.js --run-pipeline --profile fractional-boards --slot HH:MM
                    │
                    ├─ (sources.json present) ─► fetch-boards.js --profile fractional-boards --slot HH:MM
-                   │       for each enabled source due in this slot (sequential):
-                   │         adapter.validate → adapter.list → normalise → job_filters (exclude/include)
-                   │         → cross-board dedup (alsoOn) → first-run age cap
-                   │         → adapter.detail (new jobs only, incremental, crash-safe)
+                   │       for each enabled source due in this slot and not yet fetched in it (sequential):
+                   │         adapter.validate → adapter.list → normalise → ID-collision check
+                   │         → job_filters (exclude/include) → cross-board dedup (alsoOn)
+                   │         → first-run age cap (15 days)
+                   │         → per new job: CSVs first, then job-data, then adapter.detail
+                   │           (incremental, crash-safe)
                    │         → job-data-fractional-boards.json + csv/{Board}_master|_new|_excluded
                    │         → logs/board-runs/<date>_<slot>.json  (per-source status)
+                   │     (exit 1 is logged; evaluation and the digest still run on data on disk)
                    │
                    ├─ evaluate-jobs.js --profile fractional-boards --days 7 --via-cli   (unchanged)
                    │
-                   ├─ digest: new = URLs in today's csv/*_new.csv for this profile's source prefixes
-                   │          → sent-history filter → sendWhen check → deliverDigest (IMAP-verified)
+                   ├─ digest: new = URLs in today's and yesterday's csv/*_new.csv for this profile's
+                   │          source prefixes → sent-history filter → sendWhen check
+                   │          → deliverDigest (IMAP-verified)
                    │
                    └─ board_health: alert email if a source is failing / under its floor (≤1/day/source)
 
@@ -91,7 +97,7 @@ profiles/fractional-boards/
   sources.json   which boards and how to fetch them
   filters.json   exclusions + evaluationCriteria (same format as other profiles)
   csv/           this profile's CSVs
-  state/         per-source cursors and first-run markers
+  state/         per-source cursors, first-run markers, slot stamps and block flags
 ```
 
 ### 5.2 `sources.json`
@@ -104,7 +110,7 @@ profiles/fractional-boards/
     "slots": ["06:00", "14:00"],
     "delayMs": [3000, 8000],
     "maxPages": 3,
-    "firstRunMaxAgeDays": 14,
+    "firstRunMaxAgeDays": 15,
     "timeoutMs": 30000
   },
   "sources": [
@@ -126,7 +132,9 @@ profiles/fractional-boards/
       "facts": { "dayRate": ".rate", "daysPerWeek": ".commitment" }
     },
     {
+      "_comment": "Abbreviated: a real entry also needs listUrls and selectors, as for board-b.",
       "id": "marketplace-c", "name": "Marketplace C", "type": "html-list", "engine": "browser",
+      "loginUrl": "https://example.com/login",
       "loggedOutSelector": "a[href*='login']", "slots": ["06:00"]
     },
     {
@@ -143,11 +151,20 @@ Rules:
   CSV prefix is `boardPrefix(id)` = `sanitizeForFilename(id.replace(/-/g, ' '))`, so `board-a` →
   `Board-A`. Plain `sanitizeForFilename` only splits on whitespace and would give `Board-a`.
   Verified against the function on 2026-09-28.
-- Optional `keepParams: ["id", …]`: query parameters that identify a posting and must survive
-  URL canonicalisation. By default the whole query string is stripped.
+  - `validate()` rejects two ids that produce the same `boardPrefix`.
+- URL parameters (§6.5):
+  - By default only tracking parameters (`utm_*`, `ref`, `source`, `fbclid`, `gclid`, `mc_cid`,
+    `mc_eid`) and the fragment are stripped. Other query parameters are kept, because many
+    boards identify a posting by query (`/job?id=123`).
+  - Optional `stripParams: ["sort", …]` adds per-board parameters to strip. Use it for
+    parameters that vary between runs without identifying the posting.
 - Unknown keys are an error in `validate()`, so typos fail at startup, not silently at 06:00.
-- `enabled: false` keeps history and stats but stops fetching.
+  **Keys starting with `_` are ignored**, so `"_comment": "…"` can document an entry. JSON has
+  no comments.
+- `enabled` defaults to `true`. `enabled: false` keeps history and stats but stops fetching.
 - Per-source keys override `defaults`.
+- `firstRunMaxAgeDays` defaults to 15 (D17). A per-source override may lower it but not raise
+  it; `validate()` rejects a value above 15.
 
 ### 5.3 `filters.json`
 
@@ -183,13 +200,27 @@ node fetch-boards.js --profile fractional-boards [--slot HH:MM] [--source <id>] 
 - `--slot` selects the sources whose `slots` include it. With no slot, all enabled sources run.
 - `--source` runs one source, e.g. when adding or debugging a board.
 - `--dry-run` fetches and parses, then prints the rows, facts and health verdict. It writes
-  nothing: no job-data, CSV, state or run log.
-- `--login <id>` opens a **headed** browser on that source's login page using `.browser-data/`,
-  and waits for Gijs to log in. It never types credentials.
+  nothing: no job-data, CSV, state or run log. On a source's first run it also shows which items
+  the 15-day cap would hold back.
+- `--login <id>` opens a **headed** browser on that source's `loginUrl` using `.browser-data/`,
+  and waits for Gijs to log in and close the window. It never types credentials.
 - Sources run **sequentially** (a polite, predictable load). Each source runs inside its own
   try/catch, so one source can never abort the others.
-- Writes are crash-safe: job-data is saved after each detail fetch, using the same atomic
-  tmp-file-and-rename pattern as the existing scripts.
+- **Once per slot.** After a source finishes `ok` or `empty`, the run saves
+  `state/<id>.last-ok = { date, slot }`. A later run in the same date and slot skips that source
+  (`skipped`, note `already fetched this slot`). This matters when the guard re-runs every
+  profile every 15 minutes because a LinkedIn profile failed (L10): boards must not be fetched
+  again each time.
+- **Write order, per new job.** This order means a crash can never leave a job marked as seen
+  but missing from the day's new-jobs CSV:
+  1. Append it to the master CSV and today's `_new.csv`.
+  2. Write it to job-data (atomic).
+  3. Run `detail`.
+  4. Write job-data again (atomic).
+
+  A crash after step 1 can leave a duplicate CSV row on the next run. That is harmless, because
+  the digest filters through sent-history. Job-data writes use the same atomic tmp-file-and-rename
+  pattern as the existing scripts.
 - Exit codes:
   - `0`: the run completed, even if individual sources failed. Those failures are reported
     through the run log and health alerts.
@@ -213,16 +244,22 @@ module.exports = {
 };
 ```
 
-`ctx` = `{ http, browser(), imap(), log, now, state }`:
+`ctx` = `{ http, browser(), imap(), log, now, state, isKnown(jobId), firstRun }`:
 - `ctx.http.get(url)` (in `lib/sources/http.js`):
-  - Checks robots.txt, cached per host per run, and evaluates the rules for the `*` user agent.
+  - Checks robots.txt, cached per host per run, and evaluates the rules for the `*` user agent,
+    following RFC 9309:
+    - `robots.txt` returns 4xx → everything is allowed.
+    - `robots.txt` returns 5xx or a network error → nothing is fetched from that host this run.
+      The source's status is `error`, not `robots_blocked`.
   - Waits a random delay from `delayMs` between requests to the same host.
   - Uses a normal browser User-Agent.
   - Detects bot challenges: HTTP 403, 429 or 503, or page text markers such as
     `cf-challenge`, `Just a moment`, `captcha` and `challenge-platform`. It returns a typed
     result instead of throwing.
 - `ctx.browser()` starts the Playwright persistent context on `.browser-data/` lazily, only when a
-  `browser`-engine source actually runs. It reuses `lib/browser.js`.
+  `browser`-engine source actually runs. It reuses `lib/browser.js`. If Chromium's profile lock
+  (`SingletonLock`) is held, for example because `--login` is open or another profile is running,
+  the source returns `error` with the note `browser profile in use`.
 - `ctx.imap()` opens an `imapflow` session with the existing `GMAIL_USER` / `GMAIL_APP_PASSWORD`.
 
 ### 6.3 Adapter types
@@ -231,17 +268,34 @@ module.exports = {
 |---|---|---|
 | `rss` | Boards with RSS/Atom feeds | `fast-xml-parser`. `nativeId` comes from `guid`/`id`. `map` renames fields when a board repurposes them |
 | `json-api` | Boards with a public JSON endpoint | `url` + `itemsPath` + a field `map` (dot paths). Pagination by param or cursor |
-| `html-list` | Everything else | `engine: fetch` → `cheerio` on the HTTP body. `engine: browser` → Playwright page, then the same selector logic on `page.content()`. A `noResultsSelector` hit returns `empty`. `loggedOutSelector` returns `logged_out` |
+| `html-list` | Everything else | `engine: fetch` → `cheerio` on the HTTP body. `engine: browser` → Playwright page, then the same selector logic on `page.content()`. A `noResultsSelector` hit returns `empty`. `loggedOutSelector` returns `logged_out`. Selectors take the form `css` or `css@attribute` |
 | `imap-alerts` | Newsletters and board alert emails | See §6.4 |
 
+**Pagination** (`html-list` and `json-api`) stops at the first of:
+- `maxPages`
+- a page with 0 items (the end of the results, not a failure)
+- a page whose items are all known IDs, so usually only page 1 is fetched per slot
+- on a source's first run, a page whose items all have a `postedAt` older than
+  `firstRunMaxAgeDays` (the list is assumed to be newest first)
+
+`empty` and `parse_zero` (§9.1) are decided on **page 1 only**.
+
+**Posting dates.** `postedAt` is taken from an absolute date or datetime where the board gives
+one. Relative dates ("3 days ago", "vor 3 Tagen", "3 dagen geleden") are converted by one small
+EN/DE/NL parser in `lib/sources/dates.js`. Anything else leaves `postedAt: null`. For
+`imap-alerts`, `postedAt` is the email's `Date` header.
+
 **Detail step (`detail`).**
-- It runs only for **new** items with no full description yet. It uses `detail.selector` on the
-  item URL, with `engine: fetch` or `browser`.
+- It runs only for **new** items with no full description yet: `scrapeStatus` is not `ok`,
+  `seen_first_run` or `detail_failed`. It uses `detail.selector` on the item URL, with
+  `engine: fetch` or `browser`.
 - For sources with a detail step, a description under 300 characters counts as a teaser and is
   fetched again next run. It only becomes `scrapeStatus: 'ok'` once full, so the evaluator never
   judges a teaser.
-- After 3 failed attempts the item is marked `scrapeStatus: 'detail_failed'` and appears in the
-  health output.
+- After 3 failed attempts, if the record has `alsoOn` entries, the detail step is tried once on
+  each `alsoOn` URL using that source's own `detail` config. If none of them gives a full
+  description, the item is marked `scrapeStatus: 'detail_failed'` and appears in the health
+  output.
 - An adapter can declare `detail: false` when its list data already contains full descriptions,
   as some JSON APIs and newsletters do.
 
@@ -255,10 +309,11 @@ them. The digest card also shows them.
 
 - **Selecting mail.** Messages are selected by Gmail search over IMAP (`X-GM-RAW`):
   `from:(<from…>) newer_than:7d` plus `subject:` when `subjectContains` is set. The search runs
-  over All Mail, so there are **no Gmail filters to create or maintain**.
+  over All Mail, so there are **no Gmail filters to create or maintain**. If the pipeline is down
+  for more than 7 days, mail from that gap is not ingested. This is accepted.
 - **Tracking what's been read.** Processed Gmail message IDs (`X-GM-MSGID`) are stored in
   `state/imap-<id>.json`. A message is processed exactly once, even if it is later moved or
-  read.
+  read. IDs older than 30 days are pruned.
 - **Labelling.** After a message is ingested successfully, the pipeline adds the Gmail label
   `jobs/fractional-boards/<id>` via IMAP (`X-GM-LABELS`), for traceability in Gmail. If
   `archiveAfterIngest: true`, it also removes `\Inbox`. That's a per-source choice; the default
@@ -269,14 +324,16 @@ them. The digest card also shows them.
     label**.
 - **Parsing.**
   - Each sender gets a small deterministic parser in `lib/sources/parsers/<parser>.js`, using
-    cheerio on the HTML part.
-  - Each role becomes one RawListing. The URL is the role's own link. If an item has no link, the
-    URL is the issue's web or archive URL plus `#<hash(title|company)>`, which keeps URLs unique
-    and clickable.
+    cheerio on the HTML part. A parser returns `{ items, noRolesMarker }`.
+  - Each role becomes one RawListing. The URL is the role's own link.
+  - **An item with no link** gets the URL `<issue web or archive URL>#<h>` and
+    `nativeId = <h>`, where `h = hash(title|company)`. Setting `nativeId` directly matters:
+    canonicalising the URL removes the fragment, so an ID taken from the URL would be the same for
+    every link-less role in the issue and all but the first would be dropped.
   - When an email arrives from a configured sender but yields 0 items and no known "no roles
     this week" marker, the result is `parse_zero`, which usually means the template changed.
   - There is no LLM extraction by default. Using an LLM for a single irregular newsletter would be
-    an explicit per-source exception, recorded in `sources.json` with a comment.
+    an explicit per-source exception, recorded in that source's `_comment` in `sources.json`.
 - **Subscriptions.** Signing up for newsletters and alerts is done by Gijs. Claude does not
   subscribe or create accounts. They must be addressed to `GMAIL_USER`.
 
@@ -284,10 +341,11 @@ them. The digest card also shows them.
 
 | Module | Purpose |
 |---|---|
-| `lib/board_ids.js` | `boardPrefix(id)`, `jobId(sourceId, nativeId \| url)`, `canonicalUrl(url)` (strips the query string except params listed in `keepParams`, strips `utm_*` and the fragment), `normKey` by calling `sent_history.normalizeKey` |
+| `lib/board_ids.js` | `boardPrefix(id)`; `jobId(sourceId, {nativeId, url})` (§7.1); `canonicalUrl(url, stripParams)`, which removes tracking parameters, any `stripParams` and the fragment and is used **only for hashing**; `displayUrl(url)`, which removes tracking parameters only and is what `record.url` and the CSVs store; `normCompany(company, sourceName)`, which maps anonymous companies to `null` (§7.4); `normKey` by calling `sent_history.normalizeKey` |
 | `lib/job_filters.js` | Exclusion and whitelist matching with the same rules as CLAUDE.md "Exclusion Matching Rules". **`scrape-linkedin.js` is not changed in this project.** Moving it onto this module is a follow-up with a regression test on real master CSVs |
 | `lib/board_health.js` | Reads run logs and computes the status table, the `expectMinRows7d` verdicts, consecutive-failure counts and alert eligibility |
 | `lib/sources/http.js` | The polite HTTP client described in §6.2 |
+| `lib/sources/dates.js` | Absolute and relative (EN/DE/NL) posting-date parsing (§6.3) |
 
 New dependencies: `cheerio`, `fast-xml-parser`.
 
@@ -296,11 +354,17 @@ New dependencies: `cheerio`, `fast-xml-parser`.
 ### 7.1 Job IDs
 
 The format is `<sourceId>:<nativeId>`. `nativeId` is resolved in this order:
-1. The board's own stable ID (feed `guid`, API `id`, or `idPattern` on the URL).
-2. The first 12 hex characters of sha1(canonical URL).
+1. The board's own stable ID (feed `guid`, API `id`, or `idPattern` on the URL), or the
+   `nativeId` a newsletter parser set for a link-less item (§6.4).
+2. The first 12 hex characters of sha1(`canonicalUrl(url)`).
 
 The `:` separator means an ID can never collide with LinkedIn's numeric IDs. IDs are already
 URL-encoded in `/fb/:jobId/:profile/:signal` links (`web.js:660`).
+
+**Collision check.** If two *different* display URLs in one `list()` result resolve to the same
+job ID, the source's parameter settings are wrong: some query parameter identifies postings but
+is being stripped. The second item is still dropped, but the run log records note `id_collision`
+with both URLs. That is an alert (§9.2).
 
 ### 7.2 Record in `job-data-fractional-boards.json`
 
@@ -309,7 +373,7 @@ record uses the existing fields plus some additive ones:
 
 ```js
 {
-  company, title, location, url,                   // existing
+  company, title, location, url,                   // existing; url = displayUrl (§6.5)
   description, descriptionScrapedAt, scrapeStatus, // existing; evaluator requires scrapeStatus 'ok'
   evaluation,                                      // written by evaluate-jobs.js, unchanged
   source:   { id, name, type },                    // new
@@ -319,6 +383,14 @@ record uses the existing fields plus some additive ones:
   detailAttempts                                   // new
 }
 ```
+
+`scrapeStatus` takes the existing values plus two new ones:
+- `seen_first_run`: held back by the first-run age cap (§7.5). It has no description. The detail
+  step, the evaluator and the health counts all skip it.
+- `detail_failed`: see §6.3.
+
+`company` is stored as the board gave it. `normCompany()` is applied only when building dedup and
+sent-history keys.
 
 ### 7.3 CSVs
 
@@ -333,39 +405,75 @@ There is one file set per source, with the prefix `boardPrefix(id)` (§5.2):
 
 These are exactly the existing column contracts, so `parseURLsFromCSV` and the digest's "new"
 logic work unchanged. The master CSV is capped at `masterCap` rows (default 2000), as on
-LinkedIn.
+LinkedIn. Anything that selects files per source (the digest, the `/boards` stats) matches
+`_<prefix>_new.csv`, `_<prefix>_excluded.csv` and `<prefix>_master.csv` **exactly**, never with
+`startsWith`. Otherwise source `board` would also count `board-a`'s files.
 
 ### 7.4 Dedup
 
+**Anonymous companies.** Fractional boards and newsletters often hide the company or leave it
+out. `normCompany()` maps these values to `null`: empty; `confidential`; anything starting with
+`stealth`; `undisclosed`; `anonymous`; `n/a`; and the board's own name.
+
 1. **Within a source, across runs.** By job ID. An item already in job-data is not new.
 2. **Across sources, at fetch time.**
+   - Only when `normCompany(company)` is not `null`. Otherwise unrelated roles with generic titles
+     such as "Fractional CRO" would be merged.
    - If `normKey(company, title)` (with the profile's `companyAliases`) matches a record from a
      *different* source first seen within 30 days, the new listing is **not** stored as a new
      job.
    - Instead it is appended to that record's `alsoOn`, and to the source's `_excluded.csv` with
      reason `duplicate_of:<jobId>`, so the per-board stats can count it.
    - This avoids a second evaluation and lets the card say "also on …".
+   - **Exception:** a match against a `seen_first_run` record counts as a duplicate only if the
+     new listing has no `postedAt` or was posted more than `firstRunMaxAgeDays` ago. A listing
+     posted recently elsewhere is stored as its own job.
 3. **Across days.** `sent-history-fractional-boards.json` via the unchanged `lib/sent_history.js`
-   (job ID plus the 30-day `company|title` repost key).
+   (job ID plus the 30-day `company|title` repost key). When `normCompany(company)` is `null`,
+   the company passed to sent-history is `anon:<jobId>`. That turns off repost matching for the
+   job without changing `lib/sent_history.js`, so one generic "Fractional Head of Sales" does not
+   hold back every later one for 30 days.
 4. **Not across profiles (D14).**
 
-### 7.5 First-run age cap
+### 7.5 First-run age cap (D17)
 
-On a source's first successful run (no `state/<id>.first-run` marker yet), items posted more than
-`firstRunMaxAgeDays` ago are written to the master CSV and job-data as already seen, but **not**
-to `_new.csv`, so they never reach an email. Items without `postedAt` on a first run are treated
-as old. The marker is written after the run completes.
+A source's first scan must not flood the first email with old roles. On a source's first
+successful run (status `ok` or `empty`, with no `state/<id>.first-run` marker yet):
+- Items **posted more than 15 days ago** (`firstRunMaxAgeDays`, max 15, §5.2) are written to the
+  master CSV and to job-data with `scrapeStatus: 'seen_first_run'`, but **not** to `_new.csv`.
+  So they never reach an email, are never detail-fetched and are never evaluated.
+- Items **without `postedAt`** are treated the same way, because their age can't be shown to be
+  within 15 days.
+- Items posted within 15 days follow the normal path.
+- Paging stops early at a page of only old items (§6.3), so the first scan stays within the load
+  budget.
+- The marker is written after the run completes. A first run that ends in any other status (for
+  example `bot_challenge` or `error`) writes no marker, so the cap applies again on the next
+  attempt.
+- `imap-alerts` sources already only read mail from the last 7 days (§6.4). The cap still
+  applies to them, using the email's `Date` header as `postedAt`.
+- A newly added source gets a first run. Disabling and re-enabling a source keeps its marker, so
+  it gets no second first run. Deleting the marker forces one.
 
 ## 8. Email, feedback and stats
 
 ### 8.1 Digest (changes to `send-daily-digest.js`)
 
 - **Pipeline dispatch.** If the profile dir contains `sources.json`, run `fetch-boards.js`
-  (passing `--slot`) instead of `scrape-linkedin.js` + `scrape-descriptions.js`. The scrape-stamp
-  logic is not used, because board fetches are cheap and incremental.
+  (passing `--slot`) instead of `scrape-linkedin.js` + `scrape-descriptions.js`. The LinkedIn
+  scrape-stamp logic is not used; the per-source slot stamp (§6.1) replaces it.
+- **Fetch failures.** If `fetch-boards.js` exits 1, the digest logs it and still evaluates and
+  sends what is already on disk, with `fetch failed: <reason>` in the footer. If `sources.json`
+  itself cannot be parsed, the prefixes are unknown, so the digest step exits non-zero, which
+  counts as a board warning (§9.3).
 - **Prefixes.** `getProfileSearchPrefixes` returns `boardPrefix(id)` for every source in
   `sources.json` (enabled or not, so late-evaluated jobs from a just-disabled board still count).
 - **`resolveCsvDir`** (`lib/profile_paths.js`) also reads `csvSubdir` from `sources.json`.
+- **"New" window.** For profiles with `sources.json`, "new" is the URLs in **today's and
+  yesterday's** `_new.csv` files, not today's only. Sent-history stops repeats. This means a
+  failed 14:00 send is picked up at 06:00 the next day. Board failures are only warnings (§9.3),
+  so the guard never retries a board digest, and a job would otherwise be lost. LinkedIn profiles
+  keep today's window.
 - **`sendWhen`.**
   - `"any"`: skip sending when there are 0 new qualified, 0 disqualified and 0 pending jobs.
   - `"qualified"`: skip sending when there are 0 qualified.
@@ -375,6 +483,9 @@ as old. The marker is written after the run completes.
   - a source line: `via Board A · also on Board B, Newsletter D`
   - a facts row
   - the posted date
+
+  These values come from scraped HTML and newsletters, so they go through the **same HTML
+  escaping** as the existing card fields.
 - **Footer:** a board health summary, e.g. `Sources: 9 ok · 1 empty · 1 failing (Board C:
   logged_out since 2026-10-01)`.
 - **Subject:** `3 qualified, 1 disqualified [fractional-boards] — YYYY-MM-DD`, using the existing
@@ -401,9 +512,9 @@ and `logs/board-runs/`. There is no new store. For each source, over 7, 30 and 9
 | Fetched | rows in `_new` + `_excluded` CSVs |
 | Pre-filtered | `_excluded` rows by reason (filters vs `duplicate_of`) |
 | Evaluated | jobs from this source with a verdict |
-| Qualified | verdict qualified |
+| Qualified | qualified jobs this source owns **or** appears on through `alsoOn`. Sources run in config order, so without this the board listed first would get all the credit for shared jobs |
 | 👍 / 👎 | feedback signals on this source's jobs |
-| **Unique qualified** | qualified jobs with no `alsoOn` entry, i.e. not on any other board |
+| **Unique qualified** | qualified jobs with no `alsoOn` entry, i.e. not on any other board. This is the column that decides whether to drop a board |
 | Health | latest status, plus any failure streak |
 
 The weekly review email gets one line per board: `Board A: 14 fetched · 3 qualified (2 unique) ·
@@ -420,23 +531,29 @@ ms, note } }`. Pruned after 90 days.
 |---|---|---|
 | `ok` | ≥1 row parsed | — |
 | `empty` | the no-results marker was seen, or a feed/API legitimately returned 0 | normal; counts toward the floor check |
-| `parse_zero` | HTTP 200 with a non-trivial body, but 0 rows and no no-results marker | template or layout changed → alert |
+| `parse_zero` | HTTP 200 on page 1 with a non-trivial body, but 0 rows and no no-results marker | template or layout changed → alert |
 | `bot_challenge` | challenge page or 403/429/503 | skip this source until the next calendar day (state flag); alert. **No retries (L4)** |
 | `robots_blocked` | robots.txt disallows the path | skip permanently until the config changes; alert once |
 | `logged_out` | `loggedOutSelector` matched | alert with `node fetch-boards.js --login <id>`; do not retry today |
-| `error` | network error, timeout or crash in the adapter | retried at the next slot; alert after 2 consecutive |
-| `skipped` | not due this slot, disabled, or blocked for today | not a failure |
+| `error` | network error, timeout, robots.txt unreachable (§6.2), browser profile in use, or a crash in the adapter | retried at the next slot; alert after 2 consecutive |
+| `skipped` | not due this slot, disabled, blocked for today, or already fetched this slot (§6.1) | not a failure |
+
+A run-log `note` of `id_collision` (§7.1) comes with any status and is alert-worthy on its own.
 
 ### 9.2 Alerts
 
 - **Floor check.** A source with `expectMinRows7d` that has fewer rows than that in its last
-  7 days of run logs is flagged `below_floor`.
+  7 days of run logs is flagged `below_floor`. The check applies only once the source has run
+  logs covering 7 days, so a newly added source does not alert all week.
 - **Alert email.** `lib/board_health.js` decides which sources are alert-worthy:
   - any `parse_zero`, `bot_challenge`, `robots_blocked`, `logged_out` or `below_floor`
+  - an `id_collision` note
   - `error` two or more times in a row
   The alert is a short plain email (`[fractional-boards] source health — …`) sent via
   `lib/mailer.js` with IMAP verification.
   - It is sent at most once per source per day, tracked in `logs/board-health-alerts.json`.
+  - A condition that persists is alerted daily for its first 3 days, then weekly, until it
+    clears. For example, a board that stays `bot_challenge`.
   - It is sent whether or not the digest was sent, because on quiet days no digest goes out
     (D10). That is the reason this alert exists.
   - The wording is plain and neutral. Words like "spam" or "dropped" are avoided, because they
@@ -453,7 +570,7 @@ ms, note } }`. Pruned after 90 days.
   - Any **other** non-zero exit counts as `board_warnings++` with detail, **not** `failures++`.
   - Rationale: `failures` makes the guard re-run *every* profile on the next 15-minute poll. A
     broken board must never cause repeated LinkedIn re-runs and duplicate "No new jobs today"
-    emails.
+    emails. A failed board send is recovered by the two-day "new" window instead (§8.1).
 - The heartbeat message gains `WITH BOARD WARNINGS: …`, next to the geo warnings, so
   `~/.monitoring` sees it.
 - Check the plan-only mode: `DIGEST_PLAN_ONLY=1 bash run-digest.sh 06:00` lists `fractional-boards`.
@@ -461,8 +578,10 @@ ms, note } }`. Pruned after 90 days.
 ### 9.4 Load budget
 
 Expected load, with ~15 sources × ≤3 list pages × ~5.5 s plus ~10 new detail pages × ~5.5 s:
-about **5 minutes per slot** and at most a few requests per host per slot. If the per-slot time
-goes above 15 minutes, the plan-level fix is lowering `maxPages`, not parallelism.
+about **5 minutes per slot** and at most a few requests per host per slot. In steady state
+pagination usually stops after page 1 (§6.3), so it is less. A first run fetches more list pages
+but no detail pages for old items (§7.5). If the per-slot time goes above 15 minutes, the
+plan-level fix is lowering `maxPages`, not parallelism.
 
 ## 10. Testing
 
@@ -471,11 +590,13 @@ Fixtures live in `test/fixtures/boards/`.
 
 | Test | Covers |
 |---|---|
-| `test_board_ids.js` | ID resolution order, canonical URL stripping, the `:` namespace, and sanitizing prefixes |
-| `test_board_adapters.js` | Each adapter against fixtures: an RSS feed, a JSON response, an HTML list, an HTML no-results page (→ `empty`), a changed-layout page (→ `parse_zero`), a challenge page (→ `bot_challenge`), a logged-out page, and one `.eml` per newsletter parser |
-| `test_fetch_boards.js` | The pipeline with mocked adapters: per-source isolation (one throws, the others complete), cross-board `alsoOn` dedup, the first-run age cap, teaser → detail retry → `detail_failed`, slot selection, `--dry-run` writes nothing, and the exit codes |
-| `test_board_health.js` | The status table, the floor check, consecutive-error counting, and once-per-day alert suppression |
-| `test_digest_sendwhen.js` | `sendWhen` any/qualified/absent (the absent case keeps the legacy email), prefixes from `sources.json`, and card rendering with and without source/facts fields |
+| `test_board_ids.js` | ID resolution order; tracking-parameter stripping with identifying parameters kept; `stripParams`; `displayUrl` vs `canonicalUrl`; the `:` namespace; prefixes, including two ids that sanitise to the same prefix; two link-less newsletter items from one issue get **different** IDs; `normCompany` |
+| `test_board_http.js` | robots allow and disallow, robots 4xx and 5xx, each challenge marker, timeout → `error`, the per-host delay (injected clock) |
+| `test_board_dates.js` | absolute dates and EN/DE/NL relative dates; unknown formats → `null` |
+| `test_board_adapters.js` | Each adapter against fixtures: an RSS feed, a JSON response, an HTML list, an HTML no-results page (→ `empty`), a changed-layout page (→ `parse_zero`), a page-2 with 0 cards (→ end of results, not `parse_zero`), a challenge page (→ `bot_challenge`), a logged-out page, and one `.eml` per newsletter parser; early pagination stop on known IDs and on old items in a first run |
+| `test_fetch_boards.js` | The pipeline with mocked adapters: per-source isolation (one throws, the others complete); cross-board `alsoOn` dedup, and no dedup for an anonymous company; the first-run cap: items 16 days old and items with no date are held back as `seen_first_run` and not detail-fetched, items 15 days old or newer are new, and no marker after a failed first run; teaser → detail retry → `alsoOn` fallback → `detail_failed`; `id_collision`; slot selection and the once-per-slot skip; a crash between the CSV write and the job-data write still leaves the job in `_new.csv`; `--dry-run` writes nothing (directory snapshot before and after); `_comment` keys accepted and other unknown keys rejected; `firstRunMaxAgeDays` above 15 rejected; the exit codes |
+| `test_board_health.js` | The status table, the floor check and its 7-day grace, consecutive-error counting, `id_collision` alerts, once-per-day suppression and the weekly back-off, and that the alert text contains no "spam" or "dropped" |
+| `test_digest_sendwhen.js` | `sendWhen` any/qualified/absent (the absent case keeps the legacy email); prefixes from `sources.json` with exact matching; the two-day "new" window for board profiles and the one-day window for LinkedIn profiles; `anon:<jobId>` in sent-history; a LinkedIn-shaped card renders byte-identical to before; a board card with a `<script>` title comes out escaped; exit 1 from `fetch-boards.js` still sends from disk |
 | `test_run_digest_slots.sh` (extend) | `fractional-boards` is listed at both slots; a non-4 exit counts as a board warning, not a failure |
 
 Existing tests must still pass. That confirms the LinkedIn path is unchanged:
@@ -483,7 +604,8 @@ Existing tests must still pass. That confirms the LinkedIn path is unchanged:
 `test_run_digest_slots.sh`, `test_feedback_triage.js`, `test_review_render.js`.
 
 **End-to-end check before enabling the schedule:**
-1. `node fetch-boards.js --profile fractional-boards --source <first real board> --dry-run`
+1. `node fetch-boards.js --profile fractional-boards --source <first real board> --dry-run`.
+   Check that nothing older than 15 days would be new.
 2. `node send-daily-digest.js --run-pipeline --via-cli --profile fractional-boards --dry-run`
 3. One real send, verified in the Gmail Inbox via IMAP (`delivery: inbox`).
 
@@ -523,3 +645,17 @@ board, `--dry-run`, `--login`, the statuses and alerts, and a pointer to this sp
 - Creating accounts, subscribing to newsletters, or entering credentials. Gijs does these.
 - LLM-based extraction as a default path (L3, L7).
 - Parallel fetching.
+
+## 13. Assumptions to verify against the code
+
+These parts of the design depend on how existing code behaves. They were not all checked when
+the spec was written. Phase 0 of the plan checks them before any code changes. If one turns out
+wrong, change this spec first.
+
+| # | Assumption | Where | Used by |
+|---|---|---|---|
+| A1 | The "new" logic can take a date window (today + yesterday) | `send-daily-digest.js:~680` | §8.1 "New" window |
+| A2 | `sent_history` takes a caller-supplied company string, so `anon:<jobId>` works without changes | `lib/sent_history.js` | §7.4.3 |
+| A3 | Which date `evaluate-jobs.js --days 7` filters on. Jobs reach `ok` within about 1.5 days (3 detail attempts at 2 slots/day), which is inside the window for a CSV date or `descriptionScrapedAt`. Only `firstSeenAt` plus a long `bot_challenge` pause could push one out | `evaluate-jobs.js` | §6.3 |
+| A4 | What `--run-pipeline` does today when the scrape step fails | `send-daily-digest.js` | §8.1 Fetch failures |
+| A5 | The card HTML escape helper, reused for the new fields | `send-daily-digest.js` | §8.1 Card additions |
